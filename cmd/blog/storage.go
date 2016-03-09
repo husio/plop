@@ -27,7 +27,6 @@ type Entry struct {
 
 func (db *Database) Create(e Entry) Entry {
 	e.ID = randkey.New()
-	e.Created = time.Now()
 
 	db.mu.Lock()
 	defer db.mu.Unlock()

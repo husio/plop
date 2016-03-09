@@ -1,14 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
-	"strings"
+	"sync"
+	"time"
 
-	"github.com/dgrijalva/jwt"
-	"github.com/husio/envconf"
+	"github.com/husio/plop/auth"
+	"github.com/husio/plop/discovery"
+	"github.com/husio/plop/secret"
 	"github.com/husio/web"
 	"golang.org/x/net/context"
 )
@@ -17,27 +22,21 @@ func main() {
 	log.SetOutput(os.Stdout)
 	log.SetFlags(log.Lshortfile | log.Ltime)
 
-	conf := struct {
-		HTTP            string
-		JWTSignatureKey string
-	}{
-		HTTP: "localhost:8005",
-	}
-	envconf.Must(envconf.LoadEnv(&conf))
-
 	ctx := context.Background()
 	ctx = WithDB(ctx, NewDatabase())
-	ctx = context.WithValue(ctx, "jwt:signature", conf.JWTSignatureKey)
 
 	app := application{
 		ctx: ctx,
 		rt: web.NewRouter("", web.Routes{
 			web.GET(`/`, "", handleListEntries),
 			web.POST(`/`, "", handleCreateEntry),
+			web.ANY(`.*`, "", handleNotFound),
 		}),
 	}
 
-	if err := http.ListenAndServe(conf.HTTP, &app); err != nil {
+	httpAddr := discovery.Any("blog")
+	log.Printf("running HTTP: %s", httpAddr)
+	if err := http.ListenAndServe(httpAddr, &app); err != nil {
 		log.Fatalf("HTTP server error: %s", err)
 	}
 }
@@ -65,14 +64,34 @@ func handleCreateEntry(ctx context.Context, w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	token, ok := authenticated(ctx, r)
+	token, ok := auth.Authenticated(ctx, r)
 	if !ok {
 		web.StdJSONErr(w, http.StatusUnauthorized)
 		return
 	}
 
+	var currtime struct {
+		Now time.Time
+	}
+	if resp, err := GETService("currtime", "/"); err != nil {
+		web.JSONErr(w, err.Error(), http.StatusInternalServerError)
+		return
+	} else if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
+		b, _ := ioutil.ReadAll(resp.Body)
+		web.JSONErr(w, string(b), http.StatusInternalServerError)
+		return
+	} else {
+		defer resp.Body.Close()
+		if err := json.NewDecoder(resp.Body).Decode(&currtime); err != nil {
+			web.JSONErr(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
 	db := DB(ctx)
 	entry := db.Create(Entry{
+		Created: currtime.Now,
 		UserID:  token.UserID,
 		Title:   input.Title,
 		Content: input.Content,
@@ -89,31 +108,48 @@ func (app *application) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	app.rt.ServeCtxHTTP(app.ctx, w, r)
 }
 
-func authenticated(ctx context.Context, r *http.Request) (*Token, bool) {
-	auth := r.Header.Get("Authorization")
-	raw := strings.SplitN(auth, " ", 2)[1]
-	token, err := jwt.Parse(raw, func(token *jwt.Token) (interface{}, error) {
-		return sigPubKey(ctx), nil
-	})
-	if err != nil || !token.Valid {
-		return nil, false
-	}
-	tk := Token{
-		Admin:  token.Claims["admin"].(bool),
-		UserID: token.Claims["uid"].(string),
-	}
-	return &tk, true
+func handleNotFound(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	web.StdJSONErr(w, http.StatusNotFound)
 }
 
-type Token struct {
-	Admin  bool
-	UserID string
+// GETService makes GET request to given service.
+func GETService(service, path string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", "http://"+discovery.Any(service)+path, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	token.mu.Lock()
+	if token.raw == "" {
+		var body bytes.Buffer
+		if err := json.NewEncoder(&body).Encode(secret.Blog); err != nil {
+			log.Printf("cannot serialize auth credentials: %s", err)
+			return nil, err
+		}
+		resp, err := http.Post("http://"+discovery.Any("auth")+"/", "application/json", &body)
+		if err != nil {
+			log.Printf("token request failed: %s", err)
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("cannot authorize internally: %s", err)
+		}
+		var result struct {
+			Token string
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return nil, fmt.Errorf("cannot decode auth response: %s", err)
+		}
+		token.raw = result.Token
+	}
+	defer token.mu.Unlock()
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token.raw)
+	return http.DefaultClient.Do(req)
 }
 
-func sigPubKey(ctx context.Context) string {
-	sig := ctx.Value("jwt:signature")
-	if sig == nil {
-		panic("JWT signature not in context")
-	}
-	return sig.(string)
+var token struct {
+	mu  sync.Mutex
+	raw string
 }
