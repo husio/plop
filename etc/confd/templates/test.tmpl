@@ -1,0 +1,19 @@
+worker_processes 2;
+
+{{range gets "/services/*"}}
+upstream {{base .Key}} {
+    server {{index (json .Value) "host"}}:{{index (json .Value) "port"}};
+}
+
+server {
+    listen      8000;
+    server_name {{base .Key}}.plop;
+    location / {
+        proxy_pass        http://{{base .Key}};
+        proxy_redirect    off;
+        proxy_set_header  Host             $host;
+        proxy_set_header  X-Real-IP        $remote_addr;
+        proxy_set_header  X-Forwarded-For  $proxy_add_x_forwarded_for;
+    }
+}
+{{end}}
